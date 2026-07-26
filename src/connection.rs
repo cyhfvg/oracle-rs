@@ -1701,7 +1701,7 @@ impl Connection {
             match msg_type {
                 // Error (4) - may contain error or success info
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, _cid, row_count) = self.parse_error_info_with_rowcount(&mut buf, ttc_field_version)?;
+                    let (error_code, error_msg, _cid, row_count) = Self::parse_error_info_with_rowcount(&mut buf, ttc_field_version)?;
                     rows_affected = row_count;
                     if error_code != 0 && error_code != 1403 {
                         return Err(Error::OracleError {
@@ -2696,7 +2696,7 @@ impl Connection {
 
                 // Error (4) - completion or error
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, cid, rc) = self.parse_error_info_with_rowcount(&mut buf, caps.ttc_field_version)?;
+                    let (error_code, error_msg, cid, rc) = Self::parse_error_info_with_rowcount(&mut buf, caps.ttc_field_version)?;
                     cursor_id = cid;
                     row_count = rc;
                     if error_code != 0 && error_code != 1403 {
@@ -2842,7 +2842,7 @@ impl Connection {
 
                 // Error (4) - completion or error
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, _cid, rc) = self.parse_error_info_with_rowcount(&mut buf, caps.ttc_field_version)?;
+                    let (error_code, error_msg, _cid, rc) = Self::parse_error_info_with_rowcount(&mut buf, caps.ttc_field_version)?;
                     row_count = rc;
                     if error_code != 0 {
                         return Err(Error::OracleError {
@@ -3036,11 +3036,21 @@ impl Connection {
             buf.skip(al8txl as usize)?;
         }
 
-        // num key/value pairs - skip for now
+        // Each key/value pair is prefixed by a UB2 length. The value itself
+        // is encoded as TTC raw bytes and may use chunked encoding. Reading it
+        // as two CLR values shifts the packet cursor on Oracle 11g.
         let num_pairs = buf.read_ub2()?;
         for _ in 0..num_pairs {
-            buf.read_bytes_with_length()?;  // text value
-            buf.read_bytes_with_length()?;  // binary value
+            let key_len = buf.read_ub2()? as usize;
+            if key_len > 0 {
+                buf.skip(key_len)?;
+            }
+
+            let value_len = buf.read_ub2()?;
+            if value_len > 0 {
+                buf.skip_raw_bytes_chunked()?;
+            }
+
             buf.skip_ub2()?;  // keyword num
         }
 
@@ -3654,7 +3664,7 @@ impl Connection {
             match msg_type {
                 // Error (4) - may contain error or success info
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, cid, row_count) = self.parse_error_info_with_rowcount(&mut buf, ttc_field_version)?;
+                    let (error_code, error_msg, cid, row_count) = Self::parse_error_info_with_rowcount(&mut buf, ttc_field_version)?;
                     cursor_id = cid;
                     rows_affected = row_count;
                     if error_code != 0 && error_code != 1403 {
@@ -3708,7 +3718,7 @@ impl Connection {
     }
 
     /// Parse error info and return (error_code, error_msg, cursor_id, row_count)
-    fn parse_error_info_with_rowcount(&self, buf: &mut ReadBuffer, ttc_field_version: u8) -> Result<(u32, Option<String>, u16, u64)> {
+    fn parse_error_info_with_rowcount(buf: &mut ReadBuffer, ttc_field_version: u8) -> Result<(u32, Option<String>, u16, u64)> {
         // End of call status
         let _call_status = buf.read_ub4()?;
         // End to end seq#
@@ -3716,7 +3726,7 @@ impl Connection {
         // Current row number
         buf.skip_ub4()?;
         // Error number (short form)
-        buf.skip_ub2()?;
+        let error_code_short = buf.read_ub2()?;
         // Array elem error
         buf.skip_ub2()?;
         // Array elem error
@@ -3757,6 +3767,23 @@ impl Connection {
         let oerrdd_len = buf.read_ub4()?;
         if oerrdd_len > 0 {
             buf.skip_raw_bytes_chunked()?;
+        }
+
+        // Oracle 11g (TTC field version 6) sends three legacy DLC fields
+        // after oerrdd. The batch-error arrays and extended row-count fields
+        // were introduced with TTC field version 7 (Oracle 12.1).
+        if uses_legacy_completion_fields(ttc_field_version) {
+            for _ in 0..3 {
+                let _ = buf.read_bytes_with_length()?;
+            }
+
+            let error_code = error_code_short as u32;
+            let error_msg = if error_code != 0 {
+                buf.read_string_with_length()?.map(|s| s.trim().to_string())
+            } else {
+                None
+            };
+            return Ok((error_code, error_msg, cursor_id, 0));
         }
 
         // Batch error codes array
@@ -5331,6 +5358,11 @@ fn has_extended_error_fields(ttc_field_version: u8) -> bool {
     ttc_field_version >= crate::constants::ccap_value::FIELD_VERSION_21_1
 }
 
+/// Reports whether a TTC completion message uses the legacy Oracle 11g layout.
+fn uses_legacy_completion_fields(ttc_field_version: u8) -> bool {
+    ttc_field_version < crate::constants::ccap_value::FIELD_VERSION_12_1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5431,6 +5463,33 @@ mod tests {
         ));
         assert!(has_extended_error_fields(
             crate::constants::ccap_value::FIELD_VERSION_21_1,
+        ));
+    }
+
+    #[test]
+    fn parses_legacy_11g_completion_fields() {
+        let mut buf = ReadBuffer::from_slice(&[
+            0, 0, 0, 2, 5, 0x7b, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+            0, 0, 0, 0, 1, b'x',
+        ]);
+
+        let (code, message, cursor_id, row_count) =
+            Connection::parse_error_info_with_rowcount(
+                &mut buf,
+                crate::constants::ccap_value::FIELD_VERSION_11_2,
+            )
+            .expect("Oracle 11g completion payload should parse");
+
+        assert_eq!(code, 1403);
+        assert_eq!(message.as_deref(), Some("x"));
+        assert_eq!(cursor_id, 0);
+        assert_eq!(row_count, 0);
+        assert_eq!(buf.remaining(), 0);
+        assert!(uses_legacy_completion_fields(
+            crate::constants::ccap_value::FIELD_VERSION_11_2,
         ));
     }
 }

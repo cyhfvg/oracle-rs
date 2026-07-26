@@ -212,10 +212,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_accept_old_version() {
-        // Protocol version 315 (12.1)
+    fn test_parse_accept_oracle_11g() {
+        // Oracle 11g negotiates protocol version 314 and omits the 315+
+        // large-SDU and 318+ flags2 fields.
         let payload = [
-            0x01, 0x3B, // Protocol version: 315
+            0x01, 0x3A, // Protocol version: 314
             0x00, 0x01, // Service options
             0x20, 0x00, // SDU: 8192
             0xFF, 0xFF, // TDU: 65535
@@ -223,18 +224,17 @@ mod tests {
             0x00, 0x00, // Data length: 0
             0x00, 0x00, // Data offset: 0
             0x04, // Flags 0
-            0x04, // Flags 1
+            0x00, // Flags 1
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Reserved
-            0x00, 0x00, 0x20, 0x00, // SDU 32-bit: 8192
         ];
 
         let packet = make_accept_packet(&payload);
         let accept = AcceptMessage::parse(&packet).unwrap();
 
-        assert_eq!(accept.protocol_version, 315);
+        assert_eq!(accept.protocol_version, 314);
         assert_eq!(accept.sdu, 8192);
-        assert!(!accept.supports_fast_auth); // No flags2
-        assert!(accept.uses_large_sdu());
+        assert!(!accept.supports_fast_auth);
+        assert!(!accept.uses_large_sdu());
     }
 
     #[test]

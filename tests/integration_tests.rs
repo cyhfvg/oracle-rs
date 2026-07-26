@@ -149,6 +149,25 @@ mod query_tests {
 
     #[tokio::test]
     #[ignore = "requires Oracle database"]
+    async fn test_dual_query_with_bind() {
+        let conn = connect().await.expect("Failed to connect");
+
+        let result = conn
+            .query("SELECT :1 AS value FROM DUAL", &[42i64.into()])
+            .await
+            .expect("Query with bind failed");
+
+        assert_eq!(result.row_count(), 1);
+        let value = result.rows[0]
+            .get_i64(0)
+            .or_else(|| result.rows[0].get_string(0).and_then(|s| s.parse().ok()));
+        assert_eq!(value, Some(42));
+
+        conn.close().await.expect("Failed to close");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Oracle database"]
     async fn test_sysdate_query() {
         let conn = connect().await.expect("Failed to connect");
 

@@ -290,7 +290,9 @@ impl<'a> ExecuteMessage<'a> {
         } else if !opts.describe_only && !stmt.sql().is_empty() {
             // Only set IMPLICIT_RESULTSET and EXECUTE when we have SQL.
             // REF CURSORs have no SQL and should not set these flags.
-            exec_flgs |= exec_flags::IMPLICIT_RESULTSET;
+            if caps.ttc_field_version >= ccap_value::FIELD_VERSION_12_1 {
+                exec_flgs |= exec_flags::IMPLICIT_RESULTSET;
+            }
             if opts.execute && !opts.scroll_operation {
                 exec_opts |= exec_option::EXECUTE;
             }
@@ -406,12 +408,12 @@ impl<'a> ExecuteMessage<'a> {
         buf.write_ub4(0)?; // al8dnaml
         buf.write_ub4(0)?; // al8regid_msb
 
-        // DML row counts
-        if opts.dml_row_counts {
+        // DML row count fields were added with TTC field version 7 (Oracle 12.1).
+        if caps.ttc_field_version >= ccap_value::FIELD_VERSION_12_1 && opts.dml_row_counts {
             buf.write_u8(1)?; // Pointer (al8pidmlrc)
             buf.write_ub4(opts.num_execs)?; // al8pidmlrcbl
             buf.write_u8(1)?; // Pointer (al8pidmlrcl)
-        } else {
+        } else if caps.ttc_field_version >= ccap_value::FIELD_VERSION_12_1 {
             buf.write_u8(0)?; // Pointer (al8pidmlrc)
             buf.write_ub4(0)?; // al8pidmlrcbl
             buf.write_u8(0)?; // Pointer (al8pidmlrcl)
