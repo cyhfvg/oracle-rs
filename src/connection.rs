@@ -1588,9 +1588,15 @@ impl Connection {
 
         // Parse the batch response
         let payload = &response[PACKET_HEADER_SIZE..];
+        let ttc_field_version = inner.capabilities.ttc_field_version;
         drop(inner); // Release lock before parsing
 
-        self.parse_batch_response(payload, batch.rows.len(), batch.options.array_dml_row_counts)
+        self.parse_batch_response(
+            payload,
+            batch.rows.len(),
+            batch.options.array_dml_row_counts,
+            ttc_field_version,
+        )
     }
 
     /// Handle MARKER packet protocol (BREAK/RESET)
@@ -1673,6 +1679,7 @@ impl Connection {
         payload: &[u8],
         batch_size: usize,
         want_row_counts: bool,
+        ttc_field_version: u8,
     ) -> Result<BatchResult> {
         if payload.len() < 3 {
             return Err(Error::Protocol("Batch response too short".to_string()));
@@ -1694,7 +1701,7 @@ impl Connection {
             match msg_type {
                 // Error (4) - may contain error or success info
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, _cid, row_count) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, _cid, row_count) = self.parse_error_info_with_rowcount(&mut buf, ttc_field_version)?;
                     rows_affected = row_count;
                     if error_code != 0 && error_code != 1403 {
                         return Err(Error::OracleError {
@@ -2548,7 +2555,7 @@ impl Connection {
                             } else if pkt_type == PacketType::Data as u8 {
                                 // Got DATA packet - use this as the response (may contain error)
                                 let payload = &pkt[PACKET_HEADER_SIZE..];
-                                return self.parse_dml_response(payload);
+                                return self.parse_dml_response(payload, inner.capabilities.ttc_field_version);
                             } else {
                                 break;
                             }
@@ -2611,7 +2618,7 @@ impl Connection {
 
         // Parse the response to extract rows affected (or error)
         let payload = &response[PACKET_HEADER_SIZE..];
-        self.parse_dml_response(payload)
+        self.parse_dml_response(payload, inner.capabilities.ttc_field_version)
     }
 
     /// Parse query response to extract columns and rows
@@ -2689,7 +2696,7 @@ impl Connection {
 
                 // Error (4) - completion or error
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, cid, rc) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, cid, rc) = self.parse_error_info_with_rowcount(&mut buf, caps.ttc_field_version)?;
                     cursor_id = cid;
                     row_count = rc;
                     if error_code != 0 && error_code != 1403 {
@@ -2835,7 +2842,7 @@ impl Connection {
 
                 // Error (4) - completion or error
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, _cid, rc) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, _cid, rc) = self.parse_error_info_with_rowcount(&mut buf, caps.ttc_field_version)?;
                     row_count = rc;
                     if error_code != 0 {
                         return Err(Error::OracleError {
@@ -3625,7 +3632,7 @@ impl Connection {
     }
 
     /// Parse DML response to extract rows affected
-    fn parse_dml_response(&self, payload: &[u8]) -> Result<QueryResult> {
+    fn parse_dml_response(&self, payload: &[u8], ttc_field_version: u8) -> Result<QueryResult> {
         if payload.len() < 3 {
             return Err(Error::Protocol("DML response too short".to_string()));
         }
@@ -3647,7 +3654,7 @@ impl Connection {
             match msg_type {
                 // Error (4) - may contain error or success info
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, cid, row_count) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, cid, row_count) = self.parse_error_info_with_rowcount(&mut buf, ttc_field_version)?;
                     cursor_id = cid;
                     rows_affected = row_count;
                     if error_code != 0 && error_code != 1403 {
@@ -3701,7 +3708,7 @@ impl Connection {
     }
 
     /// Parse error info and return (error_code, error_msg, cursor_id, row_count)
-    fn parse_error_info_with_rowcount(&self, buf: &mut ReadBuffer) -> Result<(u32, Option<String>, u16, u64)> {
+    fn parse_error_info_with_rowcount(&self, buf: &mut ReadBuffer, ttc_field_version: u8) -> Result<(u32, Option<String>, u16, u64)> {
         // End of call status
         let _call_status = buf.read_ub4()?;
         // End to end seq#
@@ -3786,10 +3793,11 @@ impl Connection {
         // Row count (UB8) - this is the rows affected!
         let row_count = buf.read_ub8()?;
 
-        // Fields added in Oracle Database 20c (TTC field version >= 16)
-        // We always skip these since we support Oracle 20c+
-        buf.skip_ub4()?; // sql_type
-        buf.skip_ub4()?; // server_checksum
+        // These fields were introduced with Oracle Database 21c.
+        if has_extended_error_fields(ttc_field_version) {
+            buf.skip_ub4()?; // sql_type
+            buf.skip_ub4()?; // server_checksum
+        }
 
         // Error message
         let error_msg = if error_code != 0 {
@@ -5310,6 +5318,19 @@ fn oracle_type_from_name(type_name: &str) -> crate::constants::OracleType {
     }
 }
 
+/// Reports whether a TTC completion message includes Oracle 21c+ fields.
+///
+/// # Parameters
+///
+/// - `ttc_field_version`: Negotiated TTC field-version capability.
+///
+/// # Returns
+///
+/// `true` when `sql_type` and `server_checksum` follow the row count.
+fn has_extended_error_fields(ttc_field_version: u8) -> bool {
+    ttc_field_version >= crate::constants::ccap_value::FIELD_VERSION_21_1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5401,5 +5422,15 @@ mod tests {
 
         let collected: Vec<Row> = result.into_iter().collect();
         assert_eq!(collected.len(), 2);
+    }
+
+    #[test]
+    fn gates_extended_completion_fields_by_ttc_version() {
+        assert!(!has_extended_error_fields(
+            crate::constants::ccap_value::FIELD_VERSION_18_1,
+        ));
+        assert!(has_extended_error_fields(
+            crate::constants::ccap_value::FIELD_VERSION_21_1,
+        ));
     }
 }
